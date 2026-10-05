@@ -308,3 +308,57 @@ class DestructionReceiptOut(BaseModel):
     created_at: datetime
     # 销毁边界：仅擦除服务在线数据，不宣称擦除外部备份
     scope: str = "online_service_data_only"
+
+
+# ---------------------------------------------------------------------------
+# Time-limited recovery freezes (v1.8)
+# ---------------------------------------------------------------------------
+
+class FreezeStartIn(BaseModel):
+    # 谱系根托管记录：冻结覆盖根、已有后代及未来迁移产生的后代
+    root_custody_id: str
+    # 未来截止时间（必须带时区，如 2026-12-31T00:00:00Z）；到期自动失效
+    valid_until: datetime
+    # 冻结原因（仅留存于审计/回执，按秘密字段名二次过滤；不含密钥材料）
+    reason: str = Field(min_length=1, max_length=512)
+
+    @field_validator("valid_until")
+    @classmethod
+    def _must_be_zoned(cls, v: datetime) -> datetime:
+        # 不接受无时区时间：截止时间必须有明确的绝对时刻，避免服务端与
+        # 调用方对时区的理解不一致导致冻结提前/延后失效。
+        if v.tzinfo is None or v.utcoffset() is None:
+            raise ValueError("valid_until must include a timezone offset (e.g. Z or +08:00)")
+        return v
+
+
+class FreezeOut(BaseModel):
+    freeze_id: str
+    root_custody_id: str
+    status: str                                   # active | released | expired
+    reason: str
+    valid_until: datetime
+    created_at: datetime
+    released_at: datetime | None = None
+    # 谱系覆盖模型：沿已完成迁移边动态展开（含未来迁移产生的后代）
+    coverage: str = "dynamic_lineage"
+    # 提交时刻已存在并被锁定的谱系记录（根 + 已有后代）快照；未来后代由
+    # 动态展开在裁决时补入，不需要固化映射。
+    custody_ids: list[str]
+    custody_count: int
+    # 当前（查询时刻）实际生效状态：过期的 active 行呈现 expired
+    effective: str | None = None
+
+
+class FreezeReleaseOut(BaseModel):
+    freeze_id: str
+    root_custody_id: str
+    status: str                                   # released（已解除）或 expired（已到期）
+    reason: str
+    valid_until: datetime
+    created_at: datetime
+    released_at: datetime | None = None
+    coverage: str = "dynamic_lineage"
+    custody_ids: list[str]
+    custody_count: int
+    effective: str | None = None

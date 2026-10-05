@@ -1148,12 +1148,140 @@ async def main() -> int:
         except Exception as exc:  # noqa: BLE001
             check("db: destruction storage assertions", False, repr(exc))
 
+        # --- 限时恢复冻结（v1.8）-----------------------------------------
+        # 建一条 2-of-3 托管 -> 冻结根 -> 恢复创建 423、迁移照常完成 ->
+        # 冻结动态覆盖迁移后代 -> 提前解除 -> 恢复恢复。在线分片全程保留。
+        fpol = f"pol_frz_{suffix}"
+        r = await tenant.call("POST", "/policies", json={
+            "policy_id": fpol, "threshold": 2,
+            "custodian_ids": ["cus_demo_alice", "cus_demo_bob", "cus_demo_carol"],
+            "epoch": {"valid_from": "2026-01-01T00:00:00Z",
+                      "valid_until": "2035-01-01T00:00:00Z", "rotation_interval": 0}})
+        assert r.status_code == 201, r.text
+        freeze_secret = b"freeze-e2e-secret-32bytes-ok-01234567"
+        r = await tenant.call("POST", "/custodies",
+                              json={"policy_id": fpol, "expected_version": 1,
+                                    "secret_hex": freeze_secret.hex()})
+        assert r.status_code == 201, r.text
+        f_cid = r.json()["custody_id"]
+
+        # 非法截止时间：无时区 / 过去
+        await expect_error(tenant, "freeze naive deadline", "POST", "/freezes",
+                           "VALIDATION_FAILED",
+                           json={"root_custody_id": f_cid,
+                                 "valid_until": "2030-01-01T00:00:00",
+                                 "reason": "naive"})
+        await expect_error(tenant, "freeze past deadline", "POST", "/freezes",
+                           "BAD_REQUEST",
+                           json={"root_custody_id": f_cid,
+                                 "valid_until": "2020-01-01T00:00:00Z",
+                                 "reason": "past"})
+
+        # 有效冻结（1 小时后到期）
+        from datetime import datetime as _dt, timedelta as _td, timezone as _tz
+        f_until = (_dt.now(_tz.utc) + _td(hours=1)).strftime("%Y-%m-%dT%H:%M:%SZ")
+        r = await tenant.call("POST", "/freezes",
+                              json={"root_custody_id": f_cid, "valid_until": f_until,
+                                    "reason": "legal-hold-e2e"})
+        check("freeze create 201 with root snapshot + dynamic coverage",
+              r.status_code == 201 and body_of(r)["custody_ids"] == [f_cid]
+              and body_of(r)["effective"] == "active"
+              and body_of(r)["coverage"] == "dynamic_lineage", r.text[:200])
+        freeze_id = body_of(r)["freeze_id"]
+
+        # 恢复创建被冻
+        await expect_error(tenant, "recovery while frozen", "POST", "/recoveries",
+                           "CUSTODY_FROZEN",
+                           json={"custody_id": f_cid, "request_digest": "00" * 32,
+                                 "recovery_public_key": "11" * 32})
+        # 迁移创建与完成不受影响
+        ftpol = f"pol_frz_t_{suffix}"
+        r = await tenant.call("POST", "/policies", json={
+            "policy_id": ftpol, "threshold": 2,
+            "custodian_ids": ["cus_demo_alice", "cus_demo_bob", "cus_demo_carol"],
+            "epoch": {"valid_from": "2026-01-01T00:00:00Z",
+                      "valid_until": "2035-01-01T00:00:00Z", "rotation_interval": 0}})
+        assert r.status_code == 201, r.text
+
+        async def _freeze_mig_prep(cname: str, mig_id: str) -> dict:
+            r = await cuds[cname].call("POST", "/migrations/nonces", json={"migration_id": mig_id})
+            assert r.status_code == 200, r.text
+            nonce = r.json()["nonce"]
+            r = await cuds[cname].call("POST", "/migrations/shards/claim",
+                                       json={"migration_id": mig_id, "nonce": nonce})
+            assert r.status_code == 200, r.text
+            c = r.json()
+            return {"migration_id": mig_id, "nonce": nonce, "point_x": c["point_x"],
+                    "shard_hex": c["shard_hex"],
+                    "signature": sign(ckeys[cname]["signing_private_key"], c["signing_message"])}
+
+        r = await tenant.call("POST", "/migrations",
+                              headers={"Idempotency-Key": f"freeze-mig-{suffix}"},
+                              json={"source_custody_id": f_cid,
+                                    "target_policy_id": ftpol, "target_version": 1})
+        check("migration create allowed during freeze", r.status_code == 201, r.text[:200])
+        f_mid = body_of(r)["migration_id"]
+        f_child = None
+        for cname in ("alice", "bob"):
+            p = await _freeze_mig_prep(cname, f_mid)
+            r = await cuds[cname].call("POST", "/migrations/shares", json=p)
+            assert r.status_code == 200, r.text
+            f_child = body_of(r).get("new_custody_id")
+        check("migration completes during freeze, returns new custody", bool(f_child), r.text[:200])
+        # 动态后代覆盖：对迁移产生的新托管发起恢复 -> 423
+        rr = await tenant.call("POST", "/recoveries",
+                               json={"custody_id": f_child, "request_digest": "00" * 32,
+                                     "recovery_public_key": "11" * 32})
+        check("migration-produced descendant dynamically frozen",
+              rr.status_code == 423 and body_of(rr)["error"]["code"] == "CUSTODY_FROZEN"
+              and body_of(rr)["error"]["basis"]["root_custody_id"] == f_cid, rr.text[:200])
+        # 在线分片保留：根 + 后代各 3 片
+        try:
+            import asyncpg as _asyncpg
+            conn = await _asyncpg.connect(dsn=os.environ.get(
+                "KEYVAULT_DATABASE_URL", "postgresql://keyvault@db:5432/keyvault"))
+        except Exception:  # noqa: BLE001
+            conn = await _asyncpg.connect(host="/tmp", user="keyvault", database="keyvault")
+        try:
+            n_shards = await conn.fetchval(
+                "SELECT count(*) FROM shards WHERE custody_id = ANY($1::text[])",
+                [f_cid, f_child])
+            check("db: freeze retains all online encrypted shards", n_shards == 6, str(n_shards))
+            n_frozen = await conn.fetchval(
+                "SELECT count(*) FROM custody_freezes WHERE id=$1 AND status='active'",
+                freeze_id)
+            check("db: freeze row persisted active", n_frozen == 1, str(n_frozen))
+        finally:
+            await conn.close()
+        # GET / 列表
+        r = await tenant.call("GET", f"/freezes/{freeze_id}")
+        check("GET freeze by id", r.status_code == 200 and body_of(r)["freeze_id"] == freeze_id)
+        r = await tenant.call("GET", "/freezes", params={"status": "active"})
+        check("list active freezes contains ours",
+              any(f["freeze_id"] == freeze_id for f in r.json()))
+        await expect_error(dest_other, "cross-tenant GET freeze", "GET",
+                           f"/freezes/{freeze_id}", "FORBIDDEN")
+        # 提前解除
+        r = await tenant.call("POST", f"/freezes/{freeze_id}/release")
+        check("freeze release 200 effective=released",
+              r.status_code == 200 and body_of(r)["effective"] == "released", r.text[:200])
+        r = await tenant.call("POST", f"/freezes/{freeze_id}/release")
+        check("freeze release idempotent",
+              r.status_code == 200 and body_of(r)["effective"] == "released")
+        # 解除后恢复可创建
+        r = await tenant.call("POST", "/recoveries",
+                              json={"custody_id": f_child, "request_digest": "00" * 32,
+                                    "recovery_public_key": "11" * 32})
+        check("recovery create works after freeze release", r.status_code == 201, r.text[:200])
+
         # --- 审计哈希链重放 -------------------------------------------------
         r = await tenant.call("GET", "/audit/replay")
         chain = r.json()
         check("audit chain replay valid", chain.get("valid") is True, json.dumps(chain)[:300])
         raw = json.dumps(chain)
         check("audit log leaks no secret", secret_hex not in raw and secret.decode() not in raw)
+        check("audit log leaks no frozen secret",
+              freeze_secret.hex() not in raw and freeze_secret.decode() not in raw)
         # 已领取分片明文绝不进审计
         check("audit log leaks no claimed shard", c_alice["shard_hex"] not in raw)
         actions = {e["action"] for e in chain["entries"]}
@@ -1164,6 +1292,7 @@ async def main() -> int:
             "migration.start", "migration.nonce.issue", "migration.shard.claim",
             "migration.share.submit", "migration.complete",
             "destruction.complete",
+            "freeze.create", "freeze.release",
         }
         check("audit covers key lifecycle actions", expect_actions.issubset(actions),
               str(sorted(expect_actions - actions)))

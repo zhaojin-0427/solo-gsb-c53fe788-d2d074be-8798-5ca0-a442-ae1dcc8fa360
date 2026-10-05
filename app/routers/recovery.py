@@ -85,6 +85,15 @@ async def _guard_open_session(conn, sess, policy, custody, now, custodian_id: st
                    "session_status": sess["status"],
                    "custody_status": custody["status"] if custody is not None else "missing"},
         )
+    # 限时恢复冻结：在花费 nonce、下发分片明文或一次性密文**之前**裁决。
+    # custody 行锁（先于会话行锁的全局锁序）在握：先提交的冻结必在此可见；
+    # 后提交的冻结则在本事务之后裁决——两者都不可能漏冻。截止时间一律以
+    # 核对时刻新取的 clock_timestamp() 判定（now() 在锁等待开始时即冻结）。
+    fresh_now = await conn.fetchval("SELECT clock_timestamp()")
+    await repo.freeze_active_or_raise(
+        conn, tenant_id=sess["tenant_id"], custody_id=sess["custody_id"],
+        now=fresh_now, session_id=sess["id"],
+    )
     if sess["status"] == "completed":
         raise ApiError(E_SESSION_COMPLETED, basis={"session_id": sess["id"]})
     if now >= sess["valid_until"]:
@@ -132,60 +141,76 @@ async def start_recovery(body: RecoveryStartIn, request: Request, tenant=deps.Te
     ttl = body.ttl_seconds or settings.recovery_default_ttl
     ttl = min(ttl, settings.recovery_max_ttl)
     async with pool.acquire() as conn:
-        async with conn.transaction():
-            # custody 行锁：与逻辑销毁同序串行，销毁提交后不得再建恢复会话。
-            custody = await conn.fetchrow(
-                "SELECT * FROM key_custodies WHERE id = $1 FOR UPDATE", body.custody_id
-            )
-            if custody is None:
-                raise ApiError(E_NOT_FOUND, basis={"custody_id": body.custody_id})
-            if custody["tenant_id"] != tenant["id"]:
-                raise ApiError(E_FORBIDDEN, basis={"reason": "custody_belongs_to_other_tenant"})
-            policy = await repo.get_policy_version(conn, custody["policy_id"], custody["policy_version"])
-            now = await conn.fetchval("SELECT now()")
-            if custody["status"] == "destroyed":
-                raise ApiError(
-                    E_CUSTODY_DESTROYED,
-                    basis={"custody_id": custody["id"], "custody_status": custody["status"]},
+        try:
+            async with conn.transaction():
+                # custody 行锁：与逻辑销毁/冻结同序串行，销毁提交后不得再建
+                # 恢复会话；冻结先提交也在同一把锁上被确定性看到。
+                custody = await conn.fetchrow(
+                    "SELECT * FROM key_custodies WHERE id = $1 FOR UPDATE", body.custody_id
                 )
-            if policy["status"] == "revoked" or custody["status"] == "revoked":
-                raise ApiError(
-                    E_EPOCH_REVOKED,
+                if custody is None:
+                    raise ApiError(E_NOT_FOUND, basis={"custody_id": body.custody_id})
+                if custody["tenant_id"] != tenant["id"]:
+                    raise ApiError(E_FORBIDDEN, basis={"reason": "custody_belongs_to_other_tenant"})
+                policy = await repo.get_policy_version(conn, custody["policy_id"], custody["policy_version"])
+                now = await conn.fetchval("SELECT now()")
+                if custody["status"] == "destroyed":
+                    raise ApiError(
+                        E_CUSTODY_DESTROYED,
+                        basis={"custody_id": custody["id"], "custody_status": custody["status"]},
+                    )
+                # 限时恢复冻结：冻结谱系上不得新开恢复会话（迁移不受影响）。
+                fresh_now = await conn.fetchval("SELECT clock_timestamp()")
+                await repo.freeze_active_or_raise(
+                    conn, tenant_id=tenant["id"], custody_id=custody["id"], now=fresh_now,
+                )
+                if policy["status"] == "revoked" or custody["status"] == "revoked":
+                    raise ApiError(
+                        E_EPOCH_REVOKED,
+                        basis={
+                            "policy_id": custody["policy_id"],
+                            "version": custody["policy_version"],
+                            "epoch": custody["epoch_index"],
+                        },
+                    )
+                if now >= policy["epoch_valid_until"]:
+                    raise ApiError(
+                        E_EPOCH_EXPIRED,
+                        basis={"epoch": policy["epoch_index"], "valid_until": str(policy["epoch_valid_until"])},
+                    )
+                session_id = deps.new_id("rec")
+                await conn.execute(
+                    """
+                    INSERT INTO recovery_sessions
+                      (id, tenant_id, custody_id, policy_id, policy_version, epoch_index,
+                       request_digest, status, recovery_pubkey, valid_until)
+                    VALUES ($1,$2,$3,$4,$5,$6,$7,'open',$8, now() + ($9 || ' seconds')::interval)
+                    """,
+                    session_id, tenant["id"], body.custody_id, custody["policy_id"],
+                    custody["policy_version"], custody["epoch_index"], body.request_digest,
+                    body.recovery_public_key, str(ttl),
+                )
+                await audit.append_audit(
+                    conn, tenant_id=tenant["id"], actor_type="tenant", actor_id=tenant["id"],
+                    action="recovery.start", resource=session_id, result="ok",
                     basis={
-                        "policy_id": custody["policy_id"],
-                        "version": custody["policy_version"],
+                        "custody_id": body.custody_id,
+                        "policy_version": custody["policy_version"],
                         "epoch": custody["epoch_index"],
+                        "request_digest": body.request_digest,
+                        "ttl_seconds": ttl,
                     },
                 )
-            if now >= policy["epoch_valid_until"]:
-                raise ApiError(
-                    E_EPOCH_EXPIRED,
-                    basis={"epoch": policy["epoch_index"], "valid_until": str(policy["epoch_valid_until"])},
-                )
-            session_id = deps.new_id("rec")
-            await conn.execute(
-                """
-                INSERT INTO recovery_sessions
-                  (id, tenant_id, custody_id, policy_id, policy_version, epoch_index,
-                   request_digest, status, recovery_pubkey, valid_until)
-                VALUES ($1,$2,$3,$4,$5,$6,$7,'open',$8, now() + ($9 || ' seconds')::interval)
-                """,
-                session_id, tenant["id"], body.custody_id, custody["policy_id"],
-                custody["policy_version"], custody["epoch_index"], body.request_digest,
-                body.recovery_public_key, str(ttl),
+                row = await conn.fetchrow("SELECT * FROM recovery_sessions WHERE id = $1", session_id)
+        except ApiError as exc:
+            # 拒绝同样留痕（独立事务，不含秘密）；冻结/销毁/撤销等确定性
+            # 4xx/4xx-410/423 都可在审计链上解释，且不创建会话。
+            await repo.audit_denied(
+                pool, tenant_id=tenant["id"], actor_type="tenant", actor_id=tenant["id"],
+                action="recovery.start", resource=body.custody_id,
+                error_code=exc.code, basis=exc.basis,
             )
-            await audit.append_audit(
-                conn, tenant_id=tenant["id"], actor_type="tenant", actor_id=tenant["id"],
-                action="recovery.start", resource=session_id, result="ok",
-                basis={
-                    "custody_id": body.custody_id,
-                    "policy_version": custody["policy_version"],
-                    "epoch": custody["epoch_index"],
-                    "request_digest": body.request_digest,
-                    "ttl_seconds": ttl,
-                },
-            )
-            row = await conn.fetchrow("SELECT * FROM recovery_sessions WHERE id = $1", session_id)
+            raise
     return _session_out(row, 0, policy["threshold"])
 
 
