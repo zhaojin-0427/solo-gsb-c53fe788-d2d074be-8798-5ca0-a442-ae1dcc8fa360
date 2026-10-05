@@ -41,6 +41,9 @@ E_MIGRATION_COMPLETED = "MIGRATION_COMPLETED"
 E_MIGRATION_FAILED = "MIGRATION_FAILED"
 # v1.6 托管记录谱系逻辑销毁
 E_CUSTODY_DESTROYED = "CUSTODY_DESTROYED"
+# v1.8 托管谱系限时恢复冻结
+E_CUSTODY_FROZEN = "CUSTODY_FROZEN"
+E_FREEZE_NOT_ACTIVE = "FREEZE_NOT_ACTIVE"
 
 _STATUS = {
     E_BAD_REQUEST: 400,
@@ -73,6 +76,9 @@ _STATUS = {
     E_MIGRATION_COMPLETED: 409,
     E_MIGRATION_FAILED: 409,
     E_CUSTODY_DESTROYED: 410,
+    # RFC 4918 423 Locked：谱系处于限时恢复冻结，操作被冻结裁决阻断
+    E_CUSTODY_FROZEN: 423,
+    E_FREEZE_NOT_ACTIVE: 409,
 }
 
 _MESSAGES = {
@@ -106,6 +112,8 @@ _MESSAGES = {
     E_MIGRATION_COMPLETED: "migration session is already completed",
     E_MIGRATION_FAILED: "migration session has terminally failed (committed shares lost from memory); start a new migration session",
     E_CUSTODY_DESTROYED: "custody record (or its migration lineage) has been logically destroyed; online shards are deleted and in-flight recovery/migration is blocked",
+    E_CUSTODY_FROZEN: "custody record is covered by an active custody-lineage recovery freeze; recovery creation, nonce issue, shard claim and share submit are blocked until every overlapping freeze is released or expires (migrations still complete and online shards are retained)",
+    E_FREEZE_NOT_ACTIVE: "the freeze is no longer active (already released or expired)",
 }
 
 

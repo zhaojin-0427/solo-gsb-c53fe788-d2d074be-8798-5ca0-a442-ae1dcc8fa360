@@ -15,6 +15,9 @@ class Settings(BaseSettings):
     # 恢复会话默认/上限（秒）
     recovery_default_ttl: int = 300
     recovery_max_ttl: int = 600
+    # 谱系恢复冻结允许的最短/最长有效期（秒）：1 分钟 ~ 90 天
+    freeze_min_ttl: int = 60
+    freeze_max_ttl: int = 90 * 24 * 3600
     # 待托管密钥上限（字节）
     max_secret_bytes: int = 4096
     # 仅测试：开启并发交错故障注入闸门（生产保持关闭，关闭时零开销）

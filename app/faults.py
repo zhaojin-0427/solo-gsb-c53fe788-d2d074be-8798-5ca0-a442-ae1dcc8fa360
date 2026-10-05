@@ -91,6 +91,22 @@ Migration-session creation (v1.7, ``scripts.race_migration_start.py``) adds:
   under the same key, and ``X-Fault-Fail`` here injects a rebuild-INSERT
   generic / non-target-23505 failure that must surface as a raw 500.
 
+Time-limited lineage recovery freezes (v1.8, ``scripts.race_freezes.py``) add:
+
+* ``freeze.after_lineage_lock`` — after the freeze creation fixpoint-locked
+  every existing lineage custody row (id order) but before the freeze row is
+  inserted. A recovery gate (nonce/claim/submit) or a threshold migration
+  submit queued here blocks on the held custody locks, pinning the two
+  deterministic outcomes: gates queued behind the freeze only get
+  ``CUSTODY_FROZEN`` once released (no nonce spent, no shard/ciphertext),
+  while the migration still completes normally and its new descendant is
+  covered dynamically.
+* ``recovery.after_lock`` — after a recovery gate took the custody row lock
+  and the session row lock but before the freeze/destruction adjudication.
+  Parking here with a freeze creation queued on the custody lock pins the
+  opposite ordering (the gate wins: it commits its nonce normally, and only
+  later sibling gates see the committed freeze).
+
 Each gate is a fresh reached/release event pair per park cycle, so a request
 that lists several sequentially-visited gates cannot have one release fall
 through into a later listed gate.

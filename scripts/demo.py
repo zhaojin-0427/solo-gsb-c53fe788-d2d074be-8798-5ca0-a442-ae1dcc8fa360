@@ -1148,6 +1148,194 @@ async def main() -> int:
         except Exception as exc:  # noqa: BLE001
             check("db: destruction storage assertions", False, repr(exc))
 
+        # ==================================================================
+        # 托管谱系限时恢复冻结（v1.8）
+        # ==================================================================
+        # 构造链 c0 --migrate--> c1；冻结根 c0 后：恢复创建/nonce/领片/提交
+        # 全部 CUSTODY_FROZEN（不花 nonce、不计数），但迁移照常完成，且迁移产生
+        # 的“未来后代” c2 被动态覆盖（冻结快照式映射不漏后代）。
+        fpol0 = f"pol_frz0_{suffix}"
+        fpol1 = f"pol_frz1_{suffix}"
+        fpol2 = f"pol_frz2_{suffix}"
+        for pid in (fpol0, fpol1, fpol2):
+            r = await tenant.call("POST", "/policies", json={
+                "policy_id": pid, "threshold": 2,
+                "custodian_ids": ["cus_demo_alice", "cus_demo_bob", "cus_demo_carol"],
+                "epoch": epoch})
+            assert r.status_code == 201, r.text
+        freeze_secret = b"custody-lineage-freeze-secret-0123456789"
+        r = await tenant.call("POST", "/custodies",
+                              json={"policy_id": fpol0, "expected_version": 1,
+                                    "secret_hex": freeze_secret.hex()})
+        f_c0 = r.json()["custody_id"]
+        f_c1 = await full_migrate(f_c0, fpol1, f"fz-hop1-{suffix}")
+
+        # 参数校验：空原因 / 无时区时间 / 截止过近 都被拒
+        await expect_error(tenant, "freeze without reason", "POST", "/freezes",
+                           "VALIDATION_FAILED",
+                           json={"root_custody_id": f_c0,
+                                 "valid_until": "2026-12-31T00:00:00Z", "reason": ""})
+        await expect_error(tenant, "freeze naive datetime", "POST", "/freezes",
+                           "VALIDATION_FAILED",
+                           json={"root_custody_id": f_c0,
+                                 "valid_until": "2026-12-31T00:00:00", "reason": "x"})
+
+        # 冻结前先在 f_c1 上开恢复会话并备好 alice 的 nonce+分片（不提交）：
+        # 冻结后旧会话的 claim/submit 与新 nonce 全部 423，且不花 nonce、
+        # 不计数、不动内存待累计分片。
+        r = await tenant.call("POST", "/recoveries",
+                              json={"custody_id": f_c1, "request_digest": request_digest,
+                                    "recovery_public_key": wrap_pub})
+        fz_rec = r.json()["session_id"]
+        assert r.status_code == 201, r.text
+        fz_prep = await prep_share("alice", fz_rec)
+
+        # 登记冻结（未来截止 + 原因）-> 201 + 可查询 freeze_id
+        r = await tenant.call("POST", "/freezes", json={
+            "root_custody_id": f_c0,
+            "valid_until": "2026-12-31T00:00:00Z",
+            "reason": "court-ordered litigation hold"})
+        fz = body_of(r)
+        check("freeze 201 with queryable freeze_id, covers root+child",
+              r.status_code == 201 and fz["status"] == "active"
+              and fz["freeze_id"].startswith("frz_")
+              and fz["covered_custody_count"] == 2
+              and set(fz["covered_custody_ids"]) == {f_c0, f_c1}, r.text)
+        fz_id = fz["freeze_id"]
+        check("freeze response leaks no secret", freeze_secret.hex() not in r.text)
+
+        # GET 查询 + 按 custody 列表
+        r = await tenant.call("GET", f"/freezes/{fz_id}")
+        check("GET freeze by id",
+              r.status_code == 200 and body_of(r)["reason"] == "court-ordered litigation hold"
+              and body_of(r)["covered_custody_count"] == 2, r.text)
+        r = await tenant.call("GET", f"/freezes?custody_id={f_c1}")
+        check("list freezes covering descendant custody",
+              r.status_code == 200 and any(x["freeze_id"] == fz_id for x in body_of(r)), r.text)
+
+        # 冻结后恢复创建 -> CUSTODY_FROZEN（根与已有后代都覆盖）
+        for cid in (f_c0, f_c1):
+            await expect_error(tenant, f"recovery start frozen {cid[:12]}", "POST",
+                               "/recoveries", "CUSTODY_FROZEN",
+                               json={"custody_id": cid, "request_digest": request_digest,
+                                     "recovery_public_key": wrap_pub})
+
+        # alice 冻结前已领未花费 nonce：提交被冻结裁决（不是重复/已花费）；
+        # 再登记第二条重叠冻结。
+        r = await tenant.call("POST", "/freezes", json={
+            "root_custody_id": f_c0, "valid_until": "2026-12-15T00:00:00Z",
+            "reason": "second overlapping hold"})
+        fz2 = body_of(r)
+        check("overlapping freeze accepted", r.status_code == 201 and fz2["freeze_id"] != fz_id)
+        # alice 已领未花费 nonce：提交被冻结裁决（不是重复/已花费）
+        r = await cuds["alice"].call("POST", "/recoveries/shares", json=fz_prep)
+        check("submit on frozen lineage -> CUSTODY_FROZEN, no ciphertext",
+              r.status_code == 423 and body_of(r)["error"]["code"] == "CUSTODY_FROZEN"
+              and "wrap" not in r.text, r.text[:200])
+        # bob 领 nonce 被拒
+        await expect_error(cuds["bob"], "nonce issue while frozen", "POST",
+                           "/recoveries/nonces", "CUSTODY_FROZEN",
+                           json={"session_id": fz_rec})
+        st = body_of(await tenant.call("GET", f"/recoveries/{fz_rec}"))
+        check("frozen rejection changed no count (session still open 0 shares)",
+              st["status"] == "open" and st["shares_received"] == 0, json.dumps(st))
+
+        # 迁移照常完成：冻结期间 f_c1 -> fpol2 正常迁移，产生未来后代 f_c2
+        f_c2 = await full_migrate(f_c1, fpol2, f"fz-hop2-{suffix}")
+        r = await tenant.call("GET", f"/freezes/{fz_id}")
+        check("dynamic coverage includes post-freeze migration descendant",
+              set(body_of(r)["covered_custody_ids"]) == {f_c0, f_c1, f_c2}
+              and body_of(r)["covered_custody_count"] == 3, r.text)
+        await expect_error(tenant, "recovery on future descendant frozen", "POST",
+                           "/recoveries", "CUSTODY_FROZEN",
+                           json={"custody_id": f_c2, "request_digest": request_digest,
+                                 "recovery_public_key": wrap_pub})
+        # 在线分片保留、custody 全 active（冻结不删任何东西）
+        try:
+            import asyncpg
+
+            dsn = os.environ.get("KEYVAULT_DATABASE_URL", "postgresql://keyvault@db:5432/keyvault")
+            try:
+                fconn = await asyncpg.connect(dsn)
+            except Exception:
+                fconn = await asyncpg.connect(host="/tmp", user="keyvault", database="keyvault")
+            try:
+                n_shards = await fconn.fetchval(
+                    "SELECT count(*) FROM shards WHERE custody_id = ANY($1::text[])",
+                    [f_c0, f_c1, f_c2])
+                check("freeze retains all online shards (3 custodies x 3)", n_shards == 9, str(n_shards))
+            finally:
+                await fconn.close()
+        except Exception as exc:  # noqa: BLE001
+            check("freeze retains all online shards", False, repr(exc))
+
+        # 重叠冻结：只解除一条仍被冻结
+        r = await tenant.call("POST", f"/freezes/{fz_id}/release")
+        check("release first freeze 200",
+              r.status_code == 200 and body_of(r)["status"] == "released"
+              and body_of(r)["released_at"], r.text)
+        r = await tenant.call("POST", "/recoveries",
+                              json={"custody_id": f_c1, "request_digest": request_digest,
+                                    "recovery_public_key": wrap_pub})
+        check("one overlap released -> still CUSTODY_FROZEN",
+              r.status_code == 423 and body_of(r)["error"]["code"] == "CUSTODY_FROZEN"
+              and body_of(r)["error"]["basis"]["active_freeze_count"] == 1, r.text[:200])
+        # 解除重复幂等；全部解除后放行
+        r = await tenant.call("POST", f"/freezes/{fz_id}/release")
+        check("release is idempotent", r.status_code == 200 and body_of(r)["status"] == "released")
+        r = await tenant.call("POST", f"/freezes/{fz2['freeze_id']}/release")
+        assert r.status_code == 200, r.text
+        r = await tenant.call("POST", "/recoveries",
+                              json={"custody_id": f_c1, "request_digest": request_digest,
+                                    "recovery_public_key": wrap_pub})
+        check("recovery allowed after all overlaps released", r.status_code == 201, r.text[:200])
+
+        # 到期自动失效：创建一条很短的冻结，等待其过期后恢复放行；解除已到期
+        # 冻结 -> FREEZE_NOT_ACTIVE（SQL 直接写 1 秒到期行，演示无需等待 60 秒下限）
+        async def _short_freeze(cid: str) -> str:
+            import asyncpg
+
+            dsn = os.environ.get("KEYVAULT_DATABASE_URL", "postgresql://keyvault@db:5432/keyvault")
+            try:
+                fconn = await asyncpg.connect(dsn)
+            except Exception:
+                fconn = await asyncpg.connect(host="/tmp", user="keyvault", database="keyvault")
+            try:
+                return await fconn.fetchval(
+                    "INSERT INTO custody_freezes (id, tenant_id, root_custody_id, reason,"
+                    " status, valid_until) VALUES "
+                    "('frz_' || md5(random()::text), 'ten_demo', $1, 'short', 'active',"
+                    " clock_timestamp() + interval '2 second') RETURNING id", cid)
+            finally:
+                await fconn.close()
+
+        short_id = await _short_freeze(f_c2)
+        await expect_error(tenant, "short freeze blocks at first", "POST", "/recoveries",
+                           "CUSTODY_FROZEN",
+                           json={"custody_id": f_c2, "request_digest": request_digest,
+                                 "recovery_public_key": wrap_pub})
+        print("... waiting 3s for short freeze auto-expiry ...")
+        await asyncio.sleep(3)
+        r = await tenant.call("GET", f"/freezes/{short_id}")
+        check("expired freeze shows expired on GET", body_of(r)["status"] == "expired", r.text[:160])
+        await expect_error(tenant, "release expired freeze rejected", "POST",
+                           f"/freezes/{short_id}/release", "FREEZE_NOT_ACTIVE")
+        r = await tenant.call("POST", "/recoveries",
+                              json={"custody_id": f_c2, "request_digest": request_digest,
+                                    "recovery_public_key": wrap_pub})
+        check("auto-expired freeze lets recovery through", r.status_code == 201, r.text[:200])
+
+        # 解冻后的旧会话仍受其它生命周期规则约束：f_c1 上早先的会话此时仍 open，
+        # 可继续；而已销毁谱系上的冻结请求是 CUSTODY_DESTROYED。
+        await expect_error(tenant, "freeze destroyed root rejected", "POST", "/freezes",
+                           "CUSTODY_DESTROYED",
+                           json={"root_custody_id": c2, "valid_until": "2026-12-31T00:00:00Z",
+                                 "reason": "late freeze"})
+        await expect_error(dest_other, "cross-tenant freeze rejected", "POST", "/freezes",
+                           "FORBIDDEN",
+                           json={"root_custody_id": f_c0, "valid_until": "2026-12-31T00:00:00Z",
+                                 "reason": "xt"})
+
         # --- 审计哈希链重放 -------------------------------------------------
         r = await tenant.call("GET", "/audit/replay")
         chain = r.json()
@@ -1156,6 +1344,9 @@ async def main() -> int:
         check("audit log leaks no secret", secret_hex not in raw and secret.decode() not in raw)
         # 已领取分片明文绝不进审计
         check("audit log leaks no claimed shard", c_alice["shard_hex"] not in raw)
+        # 冻结审计与拒绝留痕不含秘密材料
+        check("audit log leaks no freeze secret",
+              freeze_secret.hex() not in raw and fz_prep["shard_hex"] not in raw)
         actions = {e["action"] for e in chain["entries"]}
         expect_actions = {
             "policy.create", "policy.rotate", "policy.epoch.revoke",
@@ -1164,6 +1355,7 @@ async def main() -> int:
             "migration.start", "migration.nonce.issue", "migration.shard.claim",
             "migration.share.submit", "migration.complete",
             "destruction.complete",
+            "freeze.start", "freeze.release",
         }
         check("audit covers key lifecycle actions", expect_actions.issubset(actions),
               str(sorted(expect_actions - actions)))

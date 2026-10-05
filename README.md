@@ -14,6 +14,21 @@ v1.4 新增**跨策略密钥迁移**：租户对仍有效的托管记录指定�
 
 技术栈：Python 3.12 · FastAPI · PostgreSQL 16 · `cryptography` · Docker Compose。
 
+> **新功能（v1.8）托管谱系限时恢复冻结**：租户对一条**根托管记录**提交**未来截止时间**和
+> **原因**（`POST /freezes`），服务保存冻结并返回可查询的 `freeze_id`。冻结覆盖该根及沿
+> **已完成迁移关系**的**全部已有与未来后代**——谱系覆盖在每次裁决时以递归 CTE **动态查询**
+> （冻结提交后才完成迁移产生的后代自动受冻，不存在“漏冻后代”的成员表），但冻结**不阻断迁移**：
+> 迁移照常完成、在线分片与托管记录全部保留；被裁决的只有**恢复面**。恢复创建、nonce 签发、
+> 分片领取、份额提交都在持有目标 custody 行锁后、**发出分片明文或一次性密文之前**查询有效冻结：
+> 冻结先提交则排队中的动作确定性返回 **`CUSTODY_FROZEN`（HTTP 423）**，且**不消耗 nonce、不改变
+> 计数、不触碰内存待累计分片**（可用同一未花费 nonce 在解冻后重试）。冻结创建与迁移完成、恢复
+> 校验沿用销毁路径的同一全局行锁序（**custody 行先于会话行**，冻结不引入任何新锁），既不会
+> 漏冻后代也不会与现有锁序死锁。租户可**提前解除**（`POST /freezes/{id}/release`，幂等），
+> **到期自动失效**（裁决以 `clock_timestamp()` 实时判定，GET 惰性翻转状态）；**重叠冻结须全部
+> 解除或到期才放行**（basis 返回 `active_freeze_count`）。解冻后旧会话仍受过期、撤销和销毁规则
+> 约束。**跨租户**请求与**已销毁根**一律拒绝；审计只含 ID/原因/计数，**不含任何秘密**。冻结查询、
+> 解除均提供 HTTP API。并发交错回归见 `scripts/race_freezes.py`（F1–F10，74 项）。
+
 > **新功能（v1.6）托管记录谱系逻辑销毁**：租户对任一托管记录携带**幂等键**发起逻辑销毁
 > （`POST /destructions`）。服务沿**已完成的迁移关系**（`migration_sessions.new_custody_id`）
 > 找出指定记录及其**全部后代**，在**同一事务**、按与迁移/恢复路径一致的全局行锁序
@@ -196,6 +211,7 @@ docker compose exec api python -m app.seed
 | `KEYVAULT_SHARD_MASTER_KEY` | ≥32 字节字符串或 64 位 hex，用于 HKDF 派生分片加密密钥 |
 | `KEYVAULT_ADMIN_API_KEY` | 管理端注册身份用的 API Key |
 | `KEYVAULT_RECOVERY_DEFAULT_TTL` / `KEYVAULT_RECOVERY_MAX_TTL` | 恢复会话默认/上限 TTL（秒） |
+| `KEYVAULT_FREEZE_MIN_TTL` / `KEYVAULT_FREEZE_MAX_TTL` | 谱系恢复冻结允许的最短/最长有效期（秒，默认 60 / 90 天） |
 | `KEYVAULT_FAULT_INJECTION` | 仅测试：`1` 开启并发交错故障注入闸门；默认 `0`（关闭时零开销，切勿在生产开启） |
 
 ---
@@ -203,19 +219,22 @@ docker compose exec api python -m app.seed
 ## 2. 快速体验（端到端）
 
 容器自带完整验收脚本，覆盖正常恢复、每一种拒绝依据、并发竞态、跨策略迁移、
-迁移创建并发幂等、迁移缺片故障转移、**托管记录谱系逻辑销毁**与审计链重放：
+迁移创建并发幂等、迁移缺片故障转移、**托管记录谱系逻辑销毁**、**托管谱系限时恢复冻结**
+与审计链重放：
 
 ```bash
 # 1) 并发回滚竞态回归（scripts.race_recovery，38 项）
 # 2) 迁移缺片故障转移回归（scripts.race_migration，37 项）
-# 3) 迁移创建并发幂等回归（scripts.race_migration_start，S1–S14）
-# 4) 谱系逻辑销毁回归（scripts.race_destruction，D1–D9）
-# 5) 端到端验收（scripts.demo，含销毁全流程）
+# 3) 迁移创建并发幂等回归（scripts.race_migration_start，S1–S14，93 项）
+# 4) 谱系逻辑销毁回归（scripts.race_destruction，D1–D9，72 项）
+# 5) 谱系限时恢复冻结回归（scripts.race_freezes，F1–F10，74 项）
+# 6) 端到端验收（scripts.demo，含销毁与冻结全流程，154 项）
 docker compose --profile demo run --rm demo
 ```
 
 期望依次输出 `RACE REGRESSION CHECKS PASSED`、`MIGRATION FAILOVER CHECKS PASSED`、
-`MIGRATION START IDEMPOTENCY CHECKS PASSED`、`DESTRUCTION CHECKS PASSED` 与 `ALL CHECKS PASSED`。
+`MIGRATION START IDEMPOTENCY CHECKS PASSED`、`DESTRUCTION CHECKS PASSED`、
+`FREEZE CHECKS PASSED` 与 `ALL CHECKS PASSED`。
 
 `scripts.race_recovery.py` 在进程内以真实 ASGI + 真实 PostgreSQL 行锁运行，通过仅测试构建启用的
 故障注入闸门（`KEYVAULT_FAULT_INJECTION=1`，API 服务默认关闭、关闭时零开销）精确钉住交错点：
@@ -645,11 +664,134 @@ curl -s -X POST localhost:8000/recoveries/nonces -H "X-API-Key: $CUSTODIAN_KEY" 
   在途会话，不宣称、也无法擦除数据库快照、备份磁带、对象存储版本、网关/客户端缓存等
   **外部副本**；合规上的“彻底擦除”需由底层备份生命周期与介质策略另行保证。
 
+### 2.11 托管谱系限时恢复冻结（curl 流程）
+
+租户因诉讼/合规等原因，对一条托管记录的**恢复面**设置**限时冻结**：覆盖根及全部已有/未来
+迁移后代，迁移照常完成、在线分片保留；仅恢复动作在持锁裁决后被确定性拒绝。
+
+```bash
+TENANT=tsec_...   # python -m app.seed 输出
+
+# (1) 登记冻结：根托管记录 + 未来截止时刻（带时区，默认允许 60 秒 ~ 90 天）+ 原因
+curl -s -X POST localhost:8000/freezes -H "X-API-Key: $TENANT" \
+  -H 'Content-Type: application/json' -d '{
+    "root_custody_id": "cus_secret_79071a7505bcc70cc8c2016f",
+    "valid_until": "2026-12-31T00:00:00Z",
+    "reason": "litigation hold FRZ-2026-0042 (legal-review window)"
+  }'
+```
+
+真实响应（201；id/时间随环境变化）：
+
+```json
+{
+  "freeze_id": "frz_3b71e40f37cd40e504029620",
+  "tenant_id": "ten_demo",
+  "root_custody_id": "cus_secret_79071a7505bcc70cc8c2016f",
+  "reason": "litigation hold FRZ-2026-0042 (legal-review window)",
+  "status": "active",
+  "valid_until": "2026-12-31T00:00:00Z",
+  "created_at": "2026-10-05T07:10:04.853525Z",
+  "released_at": null,
+  "covered_custody_count": 2,
+  "covered_custody_ids": [
+    "cus_secret_79071a7505bcc70cc8c2016f",
+    "cus_secret_afa29bbed26594701ba492be"
+  ]
+}
+```
+
+> `covered_custody_ids` 是该根沿**已完成迁移边**的**此刻动态快照**（本例根已迁移过一代）。
+> 冻结**提交之后**才完成迁移产生的新后代也自动受冻——它随后出现在这里，也由裁决递归 CTE
+> 实时覆盖，无需固化逐代映射，任何交错都不可能“漏冻”。
+
+```bash
+# (2) 冻结期间：恢复创建 / nonce / 领片 / 提交一律 CUSTODY_FROZEN（HTTP 423）
+curl -s -X POST localhost:8000/recoveries -H "X-API-Key: $TENANT" \
+  -H 'Content-Type: application/json' -d '{
+    "custody_id": "cus_secret_afa29bbed26594701ba492be",
+    "request_digest": "2801a9bd5720e7808a3f3a2b4c5d6e7f8091a2b3c4d5e6f708192a3b4c5d6e7f",
+    "recovery_public_key": "1111...1111"
+  }'
+```
+
+真实响应（basis 给出最早到期的覆盖冻结与仍在生效的重叠冻结数；无任何秘密）：
+
+```json
+{
+  "error": {
+    "code": "CUSTODY_FROZEN",
+    "message": "custody record is covered by an active custody-lineage recovery freeze; ...",
+    "basis": {
+      "reason": "custody_lineage_frozen",
+      "resource_kind": "custody",
+      "resource_id": "cus_secret_afa29bbed26594701ba492be",
+      "custody_id": "cus_secret_afa29bbed26594701ba492be",
+      "freeze_id": "frz_3b71e40f37cd40e504029620",
+      "freeze_root_custody_id": "cus_secret_79071a7505bcc70cc8c2016f",
+      "freeze_valid_until": "2026-12-31 00:00:00+00:00",
+      "active_freeze_count": 1
+    }
+  }
+}
+```
+
+被冻期间 nonce/claim/submit 的行为与拒绝语义：
+
+- `POST /recoveries`（含根与任意后代）、`POST /recoveries/nonces`、`POST /recoveries/shards/claim`、
+  `POST /recoveries/shares` 全部 **423 `CUSTODY_FROZEN`**；冻结先提交时排队中的请求拿锁后
+  同样只得到 423——**绝不下发分片明文或一次性密文**。
+- 确定性裁决发生在花费 nonce 之前：被拒后 nonce **未花费**（冻结前已领的未花费 nonce 可直接
+  复用重试）、`shares_received` 不变、进程内待累计分片不增不删。
+- **迁移完全不受影响**：冻结期间 `POST /migrations` 与迁移的 nonce/claim/submit 照常完成，
+  新托管记录与在线分片正常生成；新后代立即被动态覆盖。
+
+```bash
+# (3) 查询：按 id 查冻结（含动态覆盖）；按 custody 反查覆盖它的冻结（可含祖先根）
+curl -s localhost:8000/freezes/frz_3b71e40f37cd40e504029620 -H "X-API-Key: $TENANT"
+curl -s "localhost:8000/freezes?custody_id=cus_secret_afa29bbed26594701ba492be" -H "X-API-Key: $TENANT"
+
+# (4) 提前解除（幂等：重复解除返回同一份 released_at）
+curl -s -X POST localhost:8000/freezes/frz_3b71e40f37cd40e504029620/release \
+  -H "X-API-Key: $TENANT"
+# -> {"freeze_id":"frz_...","status":"released", ... "released_at":"2026-10-05T07:08:06.996249Z"}
+```
+
+**冻结语义与边界**：
+
+- `valid_until` 必须是**带时区的未来时刻**；默认有效期窗口为 60 秒 ~ 90 天
+  （`KEYVAULT_FREEZE_MIN_TTL` / `KEYVAULT_FREEZE_MAX_TTL` 可配），越界返回
+  `BAD_REQUEST`（basis.reason 为 `valid_until_too_soon` / `valid_until_too_far`）。
+- **到期自动失效**：无需调用解除；裁决始终以语句时刻 `clock_timestamp()` 实时判定，
+  `GET /freezes/{id}` 的顶层 `status` 也按时间实时显示 `expired`（惰性翻转持久状态）。
+  对已到期冻结调用解除返回 **409 `FREEZE_NOT_ACTIVE`**。
+- **重叠冻结**：同一谱系上可存在多条 active 冻结；`active_freeze_count` 给出仍在生效的覆盖
+  数量，**必须全部解除或到期**恢复才放行；只解除一条仍返回 `CUSTODY_FROZEN`。
+- **提前解除是幂等的**：对已解除冻结重复解除返回 200 与同一 `released_at`，不重复留痕。
+- **解冻后旧会话规则不变**：冻结不改变会话/custody/分片状态；解冻后冻结前已存在的恢复会话
+  继续按其自身 TTL、epoch 撤销/过期、完成态与销毁态规则执行（已完成仍 `SESSION_COMPLETED`、
+  已过期仍 `SESSION_EXPIRED`、谱系已销毁仍 `CUSTODY_DESTROYED`）。
+- **事务顺序**：冻结创建与逻辑销毁共用同一套“谱系不动点加锁”（每轮按 id `FOR UPDATE` 锁定
+  新发现的 custody 行，再沿出边扩展），所有关口则在 custody 行锁之后才取会话行锁——冻结提交
+  与迁移完成、恢复校验的先后由行锁唯一确定，只有两种结局：关口先拿锁并提交（其下发在冻结
+  存在之前，合法有效），或冻结先提交、排队关口只得到 423。冻结行从不在 custody 行之前加锁，
+  因此与现有锁序不可能死锁。
+- **拒绝依据与拒绝审计**：四类恢复关口的 423 各自留有独立事务的
+  `recovery.start` / `recovery.nonce.issue` / `recovery.shard.claim` / `recovery.share.submit`
+  denied 审计（`error_code=CUSTODY_FROZEN`）；`freeze.start` / `freeze.release` 入哈希链，
+  basis 只含冻结 id、根 id、原因、截止与覆盖计数——审计与响应全程**不含秘密/分片/nonce**。
+- 跨租户登记/查询/解除/列表一律 `FORBIDDEN`；对**已销毁**墓碑根登记冻结返回
+  `CUSTODY_DESTROYED`（已销毁记录没有可冻结的在线恢复面），不存在的根 `NOT_FOUND`。
+
+并发交错的回归验证见 `scripts/race_freezes.py`（F1–F10，74 项断言）：F6 钉住“冻结持谱系锁时
+门限迁移提交在锁队列中等待 → 迁移仍正常完成、新生后代动态受冻”；F7 钉住相反交错（恢复关口
+先持锁提交则正常下发、其后同会话的兄弟关口得 423）；F8 验证被冻的门限提交不花 nonce、不
+计数、不动内存且解冻后用同一 nonce 完成。
+
 轮换 / 撤销：
 
 ```bash
-# 原子推进到 v2（乐观锁 expected_version；可同时改托管集合/门限/epoch）
-curl -s -X POST localhost:8000/policies/pol_main/rotate -H "X-API-Key: $TENANT" \
+# 原子推进到 v2（乐观锁 expected_version；可同时改托管集合/门限/epoch）curl -s -X POST localhost:8000/policies/pol_main/rotate -H "X-API-Key: $TENANT" \
   -H 'Content-Type: application/json' \
   -d '{"expected_version":1,"epoch":{"valid_from":"2027-01-01T00:00:00Z",
         "valid_until":"2031-01-01T00:00:00Z","rotation_interval":0}}'
@@ -687,6 +829,10 @@ curl -s localhost:8000/audit/replay -H "X-API-Key: $TENANT"
 | `POST /migrations/shares` | 托管人 | 提交本人源分片+签名；源门限满足时同事务按目标策略重新分片并返回新 custody |
 | `POST /destructions` | 租户 | 携带 `Idempotency-Key`，沿已完成迁移关系逻辑销毁指定记录及全部后代（阻断在途、删除在线分片、幂等回执） |
 | `GET /destructions/{id}` | 租户 | 查询销毁回执（覆盖谱系、阻断计数、删除分片数、销毁边界） |
+| `POST /freezes` | 租户 | 登记托管谱系**限时恢复冻结**（根 custody + 未来截止 + 原因），返回可查询的 `freeze_id` 与动态谱系覆盖 |
+| `GET /freezes/{id}` | 租户 | 查询单个冻结（实时状态 active/released/expired 与动态覆盖 custody 列表） |
+| `GET /freezes?custody_id=` | 租户 | 列出本租户冻结；可按任意谱系 custody 反查覆盖它的冻结（含锚定于祖先根的冻结） |
+| `POST /freezes/{id}/release` | 租户 | 提前解除冻结（幂等）；已到期冻结返回 `FREEZE_NOT_ACTIVE`，到期本身自动生效 |
 | `GET /audit/replay` | 租户 | 重放哈希链并验证完整性 |
 
 所有拒绝响应结构统一且确定性：
@@ -724,6 +870,8 @@ curl -s localhost:8000/audit/replay -H "X-API-Key: $TENANT"
 | `MIGRATION_COMPLETED` | 迁移会话已完成（新托管记录只生成一次） |
 | `MIGRATION_FAILED` | 迁移会话已因内存待累计分片丢失进入 failed 终态；用新（或同一）幂等键重新发起迁移 |
 | `CUSTODY_DESTROYED` | 托管记录（或其迁移谱系）已逻辑销毁：在线分片已删除、在途恢复/迁移已阻断；旧会话不再下发分片或密文（HTTP 410） |
+| `CUSTODY_FROZEN` | custody 被一条未解除、未到期的谱系恢复冻结覆盖：恢复创建/nonce/领片/提交在下发分片或一次性密文前被阻断（不花 nonce、不计数、不动内存待累计分片）；迁移照常完成（HTTP 423） |
+| `FREEZE_NOT_ACTIVE` | 冻结已不在 active 态（已解除的解除请求幂等返回 200；已到期不可再解除，返回此码 409） |
 
 ---
 
@@ -827,13 +975,32 @@ open 唯一索引，等待中的旧会话请求只得 `MIGRATION_FAILED`，租�
 `scope=online_service_data_only`），**不宣称擦除外部备份**——快照/备份/对象存储版本/客户端缓存
 等副本的擦除须由其自身生命周期与介质策略保证。
 
+**托管谱系限时恢复冻结（v1.8）**
+冻结是一道**只作用于恢复面、不动任何数据**的限时裁决闸。登记事务复用销毁的谱系不动点加锁
+（每轮按 id `FOR UPDATE` 锁定已有 custody 再沿已完成迁移边扩展），但它只插入一行
+`custody_freezes`（根 id、原因、状态、截止时刻），**不更新 custody/session、不删除分片、不清
+内存**。覆盖关系**不固化映射**：裁决关口持有目标 custody 行锁后，用递归 CTE 沿已完成迁移边
+**反向**找祖先链，`status='active' AND clock_timestamp() < valid_until` 的锚定冻结全部命中即
+拒绝——因此冻结提交后才完成迁移的“未来后代”在其出生的同一刻即被覆盖，不存在可能漏写的成员
+表。关口裁决点严格位于**花费 nonce、解密下发分片、产生一次性密文之前**，423 拒绝天然满足
+“不消耗 nonce、不改变计数、不触碰内存待累计分片”；冻结先提交时在 custody 行锁队列中等待的
+恢复关口拿锁后必然读到冻结行，先拿锁提交的关口则运行于冻结存在之前——二者由行锁唯一排序，
+冻结行又从不在 custody 行之前加锁，故与销毁/迁移/恢复的既有全局锁序不可能死锁。迁移路径
+**不查询冻结**，所以冻结期间迁移照常完成、`new_custody_id` 照常产生、在线分片保留。有效期
+以语句时刻 `clock_timestamp()` 实时判定（等待中到期不会以事务开始的旧时间放行），到期自动
+失效、可提前解除且解除幂等；多条重叠冻结各自独立，递归查询返回 `active_freeze_count`，全部
+解除或到期才放行。解冻不改变旧会话的任何其它状态：过期、撤销、销毁规则继续照常约束。
+`freeze.start` / `freeze.release` 与四个关口的 `CUSTODY_FROZEN` denied 记录全部进入无明文
+哈希链（原因文本经秘密字段名过滤；分片/nonce/秘密从不出现在冻结相关响应或审计中）。
+
 **审计：按序、可重放、不泄密**
 `audit_log` 仅追加，每条记录 `seq`（事务级 advisory lock 串行分配）与
 `entry_hash = SHA256(规范字段 || prev_hash)`，形成哈希链；`GET /audit/replay`
 逐条复算并报告首个断裂点。审计内容只含 ID、版本、epoch、**分片点位与摘要**、计数等事实，
 写入口还会按字段名（secret/private/ciphertext/plaintext/share_blob/nonce/key…）二次过滤，
-拒绝事件同样留痕（含 `migration.start/nonce.issue/shard.claim/share.submit/complete`
-及其 denied 记录）。
+拒绝事件同样留痕（含 `migration.start/nonce.issue/shard.claim/share.submit/complete`、
+`destruction.complete`、`freeze.start/release` 及四类恢复关口的 `CUSTODY_FROZEN` denied
+记录）。
 
 ---
 
@@ -845,11 +1012,12 @@ pip install -r requirements.txt
 # 准备一个 PostgreSQL 16，设置 KEYVAULT_DATABASE_URL 后：
 python -m app.seed                      # 建表 + 演示身份
 uvicorn app.main:app --reload --port 8000
-KEYVAULT_BASE_URL=http://localhost:8000 python -m scripts.demo       # 端到端验收（含跨策略迁移与谱系销毁）
+KEYVAULT_BASE_URL=http://localhost:8000 python -m scripts.demo       # 端到端验收（含跨策略迁移、谱系销毁与限时冻结）
 KEYVAULT_FAULT_INJECTION=1 python -m scripts.race_recovery           # 并发回滚竞态回归（38 项）
 KEYVAULT_FAULT_INJECTION=1 python -m scripts.race_migration          # 迁移缺片故障转移回归（37 项）
-KEYVAULT_FAULT_INJECTION=1 python -m scripts.race_migration_start    # 迁移创建并发幂等回归（S1–S14）
-KEYVAULT_FAULT_INJECTION=1 python -m scripts.race_destruction        # 谱系逻辑销毁并发回归（D1–D9）
+KEYVAULT_FAULT_INJECTION=1 python -m scripts.race_migration_start    # 迁移创建并发幂等回归（S1–S14，93 项）
+KEYVAULT_FAULT_INJECTION=1 python -m scripts.race_destruction        # 谱系逻辑销毁并发回归（D1–D9，72 项）
+KEYVAULT_FAULT_INJECTION=1 python -m scripts.race_freezes            # 谱系限时恢复冻结并发回归（F1–F10，74 项）
 ```
 
 ## 6. 生产注意（本仓库为演示强化基线，上线前至少完成）

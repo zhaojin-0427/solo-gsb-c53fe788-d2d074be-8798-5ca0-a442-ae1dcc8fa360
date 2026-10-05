@@ -44,7 +44,7 @@ import json
 import asyncpg
 from fastapi import APIRouter, Header, Request, Response
 
-from .. import audit, crypto, deps, faults, repo
+from .. import audit, crypto, deps, faults, freezing, repo
 from ..errors import ApiError, E_BAD_REQUEST, E_FORBIDDEN, E_IDEMPOTENCY_CONFLICT, E_NOT_FOUND
 from ..schemas import DestructionReceiptOut, DestructionStartIn
 
@@ -126,35 +126,14 @@ async def destroy_lineage(
                     # 撞 uq_destruction_idem 后的确定性 409 与整体回滚。
                     await faults.maybe_park(request, "destruction.after_receipt_check")
                     await faults.maybe_raise(request, "destruction.after_receipt_check")
-                    # ② 谱系展开 + 锁定（不动点）：每轮先按 id 顺序锁定
-                    # “新发现的已完成迁移后代” custody 行，再沿其出边扩展。
-                    # 与迁移完成路径同一全局锁序（custody 先于 migration 行），
-                    # 因此销毁 × 迁移完成永远不死锁，且必有确定性的先后：
-                    # 若有迁移正持有子 custody 行锁（提交临界区），销毁在此等待；
-                    # 它一旦提交，下一轮展开必能看到新后代并纳入销毁——绝不漏删。
-                    lineage: list[str] = []
-                    frontier = [root["id"]]
-                    locked: set[str] = set()
-                    while frontier:
-                        frontier = sorted(set(frontier) - locked)
-                        if not frontier:
-                            break
-                        rows = await conn.fetch(
-                            "SELECT id FROM key_custodies WHERE id = ANY($1::text[]) "
-                            "ORDER BY id FOR UPDATE",
-                            frontier,
-                        )
-                        got = [r["id"] for r in rows]
-                        locked.update(got)
-                        lineage.extend(got)
-                        # 仅沿“已完成迁移关系”前进（new_custody_id 非空的会话）。
-                        children = await conn.fetch(
-                            "SELECT new_custody_id AS cid FROM migration_sessions "
-                            "WHERE source_custody_id = ANY($1::text[]) "
-                            "AND new_custody_id IS NOT NULL",
-                            got,
-                        )
-                        frontier = [r["cid"] for r in children if r["cid"] not in locked]
+                    # ② 谱系展开 + 锁定（不动点）：与冻结创建共用同一实现——
+                    # 每轮先按 id 顺序锁定“新发现的已完成迁移后代” custody 行，
+                    # 再沿其出边扩展。与迁移完成路径同一全局锁序（custody 先于
+                    # migration 行），因此销毁 × 迁移完成永远不死锁，且必有确定
+                    # 性的先后：若有迁移正持有子 custody 行锁（提交临界区），
+                    # 销毁在此等待；它一旦提交，下一轮展开必能看到新后代并纳入
+                    # 销毁——绝不漏删。
+                    lineage = await freezing.lock_forward_lineage(conn, root["id"])
 
                     # 回归闸门：谱系 custody 行锁已全部持有、会话尚未锁定
                     # （仅测试构建启用，用来钉住“销毁 × 在途会话”的交错）。

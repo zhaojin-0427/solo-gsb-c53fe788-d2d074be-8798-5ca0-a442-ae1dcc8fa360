@@ -308,3 +308,49 @@ class DestructionReceiptOut(BaseModel):
     created_at: datetime
     # 销毁边界：仅擦除服务在线数据，不宣称擦除外部备份
     scope: str = "online_service_data_only"
+
+
+# ---------------------------------------------------------------------------
+# Time-limited recovery freeze of a custody lineage (v1.8)
+# ---------------------------------------------------------------------------
+
+class FreezeCreateIn(BaseModel):
+    # 冻结锚定的根托管记录：覆盖其自身与沿“已完成迁移关系”的全部已有/未来后代
+    root_custody_id: str
+    # 未来截止时刻（必须带时区且晚于服务当前时间；到期后自动失效）
+    valid_until: datetime
+    # 人/机可读的冻结原因，随审计留存（审计的秘密字段过滤仍生效）
+    reason: str = Field(min_length=1, max_length=512)
+
+    @field_validator("valid_until")
+    @classmethod
+    def _aware(cls, v: datetime) -> datetime:
+        if v.tzinfo is None or v.utcoffset() is None:
+            raise ValueError("valid_until must be timezone-aware (e.g. 2026-10-05T12:00:00Z)")
+        return v
+
+
+class FreezeOut(BaseModel):
+    freeze_id: str
+    tenant_id: str
+    root_custody_id: str
+    reason: str
+    # 固化的状态列（active | released | expired）；已到期但惰性状态尚未翻转时，
+    # 顶层 status 按 valid_until 实时计算为 expired（见 effective_status）。
+    status: str
+    valid_until: datetime
+    created_at: datetime
+    released_at: datetime | None = None
+    # 谱系覆盖动态查询结果：此刻该根沿已完成迁移边可达的全部 custody（含根本身）。
+    # 冻结提交后新完成的迁移后代会自动出现在这里，也自动受冻结裁决约束。
+    covered_custody_count: int
+    covered_custody_ids: list[str]
+
+
+class FreezeReleaseOut(BaseModel):
+    freeze_id: str
+    status: str
+    root_custody_id: str
+    valid_until: datetime
+    created_at: datetime
+    released_at: datetime

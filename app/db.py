@@ -202,6 +202,26 @@ CREATE INDEX IF NOT EXISTS idx_destruction_tenant ON destructions(tenant_id);
 CREATE UNIQUE INDEX IF NOT EXISTS uq_destruction_idem
     ON destructions(tenant_id, idempotency_key_hash);
 
+-- 托管谱系“限时恢复冻结”（v1.8）：租户对一条根托管记录登记冻结与未来
+-- 截止时刻，覆盖该根及其沿“已完成迁移关系”的全部已有与未来后代。冻结不
+-- 阻断迁移（迁移照常完成、在线分片保留），但恢复创建/nonce/领片/提交在持有
+-- 目标 custody 行锁后按谱系动态裁决：存在未解除且未到期的覆盖冻结时，在
+-- 下发分片或一次性密文之前确定性返回 CUSTODY_FROZEN（不花 nonce、不计数、
+-- 不入内存池）。可提前解除；到期自动失效；多条重叠冻结须全部解除/到期才放行。
+CREATE TABLE IF NOT EXISTS custody_freezes (
+    id               TEXT PRIMARY KEY,
+    tenant_id        TEXT NOT NULL REFERENCES tenants(id),
+    root_custody_id  TEXT NOT NULL REFERENCES key_custodies(id),
+    reason           TEXT NOT NULL,
+    status           TEXT NOT NULL DEFAULT 'active',  -- active | released | expired
+    valid_until      TIMESTAMPTZ NOT NULL,            -- 到期自动失效（未来时刻）
+    created_at       TIMESTAMPTZ NOT NULL DEFAULT now(),
+    released_at      TIMESTAMPTZ
+);
+CREATE INDEX IF NOT EXISTS idx_freeze_tenant ON custody_freezes(tenant_id);
+-- 谱系覆盖动态裁决按根反查（只沿已完成迁移边，见 routers/freezing.py 的递归 CTE）。
+CREATE INDEX IF NOT EXISTS idx_freeze_root ON custody_freezes(root_custody_id);
+
 -- 仅追加、哈希链审计日志（不含任何秘密材料）。
 CREATE TABLE IF NOT EXISTS audit_log (
     seq          BIGSERIAL PRIMARY KEY,

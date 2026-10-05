@@ -10,7 +10,7 @@ from .db import Database, wait_for_database
 from .errors import install_exception_handlers
 from .faults import FaultBoard
 from .pending import PendingShareStore
-from .routers import admin, audit_log, custodies, destructions, migrations, policies, recovery
+from .routers import admin, audit_log, custodies, destructions, freezes, migrations, policies, recovery
 
 
 async def _pending_sweeper(app: FastAPI) -> None:
@@ -44,8 +44,8 @@ async def lifespan(app: FastAPI):
 
 app = FastAPI(
     title="多方密钥分片托管与门限恢复 API",
-    version="1.7.2",
-    description="不可变策略 + Shamir n-of-m 分片 + 门限恢复 + 跨策略密钥迁移（缺片 failed 终态可安全重试；创建会话并发同键按实际约束确定性 409/200 兜底，胜方 open→completed 不漏判、终态行不占位；终态后重建在 savepoint 内按实时 clock_timestamp() 与源/目标策略行锁重新核对，目标失效确定性 MIGRATION_TARGET_INVALID 且独立留痕）+ 托管记录谱系逻辑销毁",
+    version="1.8.0",
+    description="不可变策略 + Shamir n-of-m 分片 + 门限恢复 + 跨策略密钥迁移 + 托管记录谱系逻辑销毁 + 托管谱系限时恢复冻结（POST /freezes 登记、GET /freezes 查询、POST /freezes/{id}/release 提前解除；冻结覆盖根及已有/未来迁移后代，迁移照常完成、在线分片保留；恢复创建/nonce/领片/提交在持锁裁决后确定性 CUSTODY_FROZEN，不花 nonce、不计数、不入内存池；到期自动失效，重叠冻结须全部解除或到期才放行）",
     lifespan=lifespan,
 )
 install_exception_handlers(app)
@@ -56,6 +56,7 @@ app.include_router(custodies.router)
 app.include_router(recovery.router)
 app.include_router(migrations.router)
 app.include_router(destructions.router)
+app.include_router(freezes.router)
 app.include_router(audit_log.router)
 
 

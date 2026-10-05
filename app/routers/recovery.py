@@ -4,7 +4,7 @@ import json
 
 from fastapi import APIRouter, Request
 
-from .. import audit, crypto, deps, repo
+from .. import audit, crypto, deps, freezing, repo
 from .. import faults
 from ..config import get_settings
 from ..errors import (
@@ -85,6 +85,14 @@ async def _guard_open_session(conn, sess, policy, custody, now, custodian_id: st
                    "session_status": sess["status"],
                    "custody_status": custody["status"] if custody is not None else "missing"},
         )
+    # 限时恢复冻结（v1.8）：谱系上存在未解除、未到期的冻结时，在花费 nonce、
+    # 下发分片明文或一次性密文之前确定性拒绝。调用时已持有该 custody 行锁，
+    # 因此与冻结提交的先后由行锁唯一确定；冻结先提交则这里必能看到它。
+    # 旧会话既有的过期/撤销/完成/已提交规则在解冻后继续照常生效。
+    await freezing.ensure_not_frozen(
+        conn, sess["custody_id"], now=now,
+        resource_id=sess["id"], resource_kind="recovery_session",
+    )
     if sess["status"] == "completed":
         raise ApiError(E_SESSION_COMPLETED, basis={"session_id": sess["id"]})
     if now >= sess["valid_until"]:
@@ -132,8 +140,12 @@ async def start_recovery(body: RecoveryStartIn, request: Request, tenant=deps.Te
     ttl = body.ttl_seconds or settings.recovery_default_ttl
     ttl = min(ttl, settings.recovery_max_ttl)
     async with pool.acquire() as conn:
-        async with conn.transaction():
-            # custody 行锁：与逻辑销毁同序串行，销毁提交后不得再建恢复会话。
+        tx = conn.transaction()
+        await tx.start()
+        sess_tenant: str | None = None
+        try:
+            # custody 行锁：与逻辑销毁、冻结创建同序串行；销毁提交后不得再建
+            # 恢复会话；冻结提交后建会话请求在锁上排队，拿锁后被确定性拒绝。
             custody = await conn.fetchrow(
                 "SELECT * FROM key_custodies WHERE id = $1 FOR UPDATE", body.custody_id
             )
@@ -143,11 +155,18 @@ async def start_recovery(body: RecoveryStartIn, request: Request, tenant=deps.Te
                 raise ApiError(E_FORBIDDEN, basis={"reason": "custody_belongs_to_other_tenant"})
             policy = await repo.get_policy_version(conn, custody["policy_id"], custody["policy_version"])
             now = await conn.fetchval("SELECT now()")
+            sess_tenant = tenant["id"]
             if custody["status"] == "destroyed":
                 raise ApiError(
                     E_CUSTODY_DESTROYED,
                     basis={"custody_id": custody["id"], "custody_status": custody["status"]},
                 )
+            # 冻结裁决必须在插入会话行之前：冻结先提交则此处返回 CUSTODY_FROZEN，
+            # 不创建会话、不留下成功审计。
+            await freezing.ensure_not_frozen(
+                conn, custody["id"], now=now,
+                resource_id=custody["id"], resource_kind="custody",
+            )
             if policy["status"] == "revoked" or custody["status"] == "revoked":
                 raise ApiError(
                     E_EPOCH_REVOKED,
@@ -186,6 +205,15 @@ async def start_recovery(body: RecoveryStartIn, request: Request, tenant=deps.Te
                 },
             )
             row = await conn.fetchrow("SELECT * FROM recovery_sessions WHERE id = $1", session_id)
+            await tx.commit()
+        except ApiError as exc:
+            await tx.rollback()
+            await repo.audit_denied(
+                pool, tenant_id=sess_tenant, actor_type="tenant", actor_id=tenant["id"],
+                action="recovery.start", resource=body.custody_id,
+                error_code=exc.code, basis=exc.basis,
+            )
+            raise
     return _session_out(row, 0, policy["threshold"])
 
 
@@ -228,6 +256,8 @@ async def issue_nonce(body: NonceRequestIn, request: Request, custodian=deps.Cus
             sess_tenant = sess["tenant_id"]
             policy = await repo.get_policy_version(conn, sess["policy_id"], sess["policy_version"])
             now = await conn.fetchval("SELECT now()")
+            # 回归闸门：custody + 会话行锁已持有、冻结/销毁裁决之前（仅测试构建）。
+            await faults.maybe_park(request, "recovery.after_lock")
             await _guard_open_session(conn, sess, policy, custody, now, custodian["id"])
 
             shard = await _custody_shard(conn, sess["custody_id"], custodian["id"])
@@ -322,6 +352,8 @@ async def claim_shard(body: ShardClaimIn, request: Request, custodian=deps.Custo
             sess_tenant = sess["tenant_id"]
             policy = await repo.get_policy_version(conn, sess["policy_id"], sess["policy_version"])
             now = await conn.fetchval("SELECT now()")
+            # 回归闸门：custody + 会话行锁已持有、冻结/销毁裁决之前（仅测试构建）。
+            await faults.maybe_park(request, "recovery.after_lock")
             await _guard_open_session(conn, sess, policy, custody, now, custodian["id"])
 
             nonce_row = await _resolve_nonce(conn, body.session_id, body.nonce, custodian["id"])
